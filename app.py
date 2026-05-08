@@ -48,23 +48,34 @@ print(f"DEBUG: PROJECT_ROOT: {PROJECT_ROOT}")
 print(f"DEBUG: sys.path: {sys.path[:3]}")
 print(f"DEBUG: src exists: {(PROJECT_ROOT / 'src').exists()}")
 
-from src.config import (
-    CFULL_END,
-    CFULL_START,
-    DATA_PROCESSED,
-    DATA_RAW,
-    JP_TICKERS,
-    JP_TICKER_NAMES,
-    NUM_FACTORS,
-    QUANTILE_THRESHOLD,
-    REGULARIZATION_LAMBDA,
-    ROLLING_WINDOW,
-    TEST_START,
-)
-from src.signal.prior_subspace import build_prior_subspace, compute_cfull
-from src.signal.regularized_pca import regularized_pca, rolling_standardize
-from src.portfolio.construction import construct_portfolio, construct_portfolio_with_crash_filter, construct_original_portfolio_with_crash_filter
-from src.evaluation.metrics import compute_metrics
+# --- インポートの試行 ---
+try:
+    from src.config import (
+        CFULL_END, CFULL_START, DATA_PROCESSED, DATA_RAW,
+        JP_TICKERS, JP_TICKER_NAMES, NUM_FACTORS, QUANTILE_THRESHOLD,
+        REGULARIZATION_LAMBDA, ROLLING_WINDOW, TEST_START
+    )
+except ModuleNotFoundError as e:
+    print(f"DEBUG: Initial import failed: {e}")
+    try:
+        from config import (
+            CFULL_END, CFULL_START, DATA_PROCESSED, DATA_RAW,
+            JP_TICKERS, JP_TICKER_NAMES, NUM_FACTORS, QUANTILE_THRESHOLD,
+            REGULARIZATION_LAMBDA, ROLLING_WINDOW, TEST_START
+        )
+    except ModuleNotFoundError:
+        st.error(f"src.config が見つかりません。フォルダ構成を確認してください。\nError: {e}")
+        st.stop()
+try:
+    from src.signal.prior_subspace import build_prior_subspace, compute_cfull
+    from src.signal.regularized_pca import regularized_pca, rolling_standardize
+    from src.portfolio.construction import construct_portfolio, construct_portfolio_with_crash_filter, construct_original_portfolio_with_crash_filter
+    from src.evaluation.metrics import compute_metrics
+except ModuleNotFoundError:
+    from signal.prior_subspace import build_prior_subspace, compute_cfull
+    from regularized_pca import regularized_pca, rolling_standardize
+    from portfolio.construction import construct_portfolio, construct_portfolio_with_crash_filter, construct_original_portfolio_with_crash_filter
+    from evaluation.metrics import compute_metrics
 
 @st.cache_data(show_spinner="データを読み込み中...", ttl="12h")
 def load_data():
