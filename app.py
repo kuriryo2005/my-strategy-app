@@ -33,12 +33,20 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 from scipy import stats
-# ---------------------------------------------------------------------------
-# Project imports
-# ---------------------------------------------------------------------------
+# --- プロジェクトルートをパスに追加 ---
+import sys
+from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# srcフォルダ自体も明示的に追加（念のため）
+# --- デバッグ用 ---
+import os
+print(f"DEBUG: Current Directory: {os.getcwd()}")
+print(f"DEBUG: PROJECT_ROOT: {PROJECT_ROOT}")
+print(f"DEBUG: sys.path: {sys.path[:3]}")
+print(f"DEBUG: src exists: {(PROJECT_ROOT / 'src').exists()}")
 
 from src.config import (
     CFULL_END,
