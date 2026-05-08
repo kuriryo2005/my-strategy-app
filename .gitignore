@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Streamlit
+.streamlit/
+static/
+
+# Data (Raw data can be fetched, keeping processed data for quick load)
+# data/raw/  # Optional: Uncomment if raw data is too large
+*.log
+
+# VS Code / IDE
+.vscode/
+.idea/
+.history/
