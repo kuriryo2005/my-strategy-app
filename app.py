@@ -17,7 +17,16 @@ import subprocess
 import matplotlib.pyplot as plt
 
 # --- 日本語フォント設定 ---
-import japanize_matplotlib 
+import matplotlib.font_manager as fm
+_jp_font_candidates = ["IPAexGothic", "Hiragino Sans", "Yu Gothic", "Meiryo", "MS Gothic", "DejaVu Sans"]
+_jp_font_set = False
+for _fn in _jp_font_candidates:
+    if any(_fn in f.name for f in fm.fontManager.ttflist):
+        plt.rcParams['font.family'] = _fn
+        _jp_font_set = True
+        break
+if not _jp_font_set:
+    plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['axes.unicode_minus'] = False
 import numpy as np
 import pandas as pd
