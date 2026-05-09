@@ -1,0 +1,109 @@
+elif page == "バックテスト結果":
+    st.header("バックテスト結果 (PCA SUB)")
+
+    # 1. 全期間ハイブリッド実績
+    st.subheader("1. 全期間ハイブリッド実績")
+    col_bt_date, _ = st.columns([1, 2])
+    with col_bt_date:
+        bt_custom_start = st.date_input("表示開始日を選択", value=bt_start_date, key="bt_custom_start")
+    test_start_str_custom = bt_custom_start.strftime("%Y-%m-%d")
+    
+    daily_rets, df_pnl = run_pca_sub_backtest(test_start_str_custom, leverage=leverage)
+    
+    metrics_all = compute_metrics(daily_rets)
+    active_rets = daily_rets[daily_rets != 0]
+    win_rate_val = (active_rets > 0).mean() if not active_rets.empty else 0.0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("年率リターン", f"{metrics_all['AR'] * 100:.1f}%")
+    c2.metric("累積リターン", f"{metrics_all['TOTAL_RETURN'] * 100:.1f}%")
+    c3.metric("最大DD", f"{metrics_all['MDD'] * 100:.2f}%")
+    c4.metric("RR比", f"{metrics_all['RR']:.2f}")
+    c5.metric("勝率", f"{win_rate_val*100:.1f}%")
+
+    st.subheader("累積リターン推移")
+    cum_all = (1.0 + daily_rets).cumprod()
+    fig_all, ax_all = plt.subplots(figsize=(12, 4))
+    ax_all.plot(cum_all.index, cum_all.values, color="#2ca02c", linewidth=2)
+    ax_all.axhline(y=1.0, color="grey", linestyle="--", alpha=0.5)
+    st.pyplot(fig_all)
+    plt.close(fig_all)
+
+    st.markdown("---")
+
+    # 2. 構造変化後の逆張り実績 (4/8 〜)
+    st.subheader("2. 構造変化後の逆張り実績 (4/8 〜)")
+    rets_post_408 = daily_rets[daily_rets.index >= pd.Timestamp("2026-04-08")]
+    
+    if not rets_post_408.empty:
+        metrics_post = compute_metrics(rets_post_408)
+        cum_post = (1.0 + rets_post_408).cumprod()
+        
+        cp1, cp2, cp3 = st.columns(3)
+        cp1.metric("期間累積", f"{metrics_post['TOTAL_RETURN'] * 100:.1f}%")
+        cp2.metric("最大DD", f"{metrics_post['MDD'] * 100:.2f}%")
+        cp3.metric("RR比", f"{metrics_post['RR']:.2f}")
+
+        fig_post, ax_post = plt.subplots(figsize=(12, 4))
+        ax_post.plot(cum_post.index, cum_post.values, color="#1f77b4", linewidth=2)
+        ax_post.axhline(y=1.0, color="grey", linestyle="--", alpha=0.5)
+        st.pyplot(fig_post)
+        plt.close(fig_post)
+
+        # 🔍 2026年5月 戦略スイッチ比較分析
+        st.markdown("#### 🔍 2026年5月 戦略スイッチ比較分析")
+        may_mask = daily_rets.index >= pd.Timestamp("2026-05-01")
+        if may_mask.any():
+            new_rule_rets = daily_rets[may_mask]
+            old_rule_rets = -new_rule_rets
+            
+            old_cum = (1 + old_rule_rets).prod() - 1
+            new_cum = (1 + new_rule_rets).prod() - 1
+            
+            cm1, cm2 = st.columns(2)
+            cm1.metric("従来 (順張り) 5月累計", f"{old_cum*100:+.2f}%")
+            cm2.metric("新 (逆張り) 5月累計", f"{new_cum*100:+.2f}%", delta=f"{(new_cum-old_cum)*100:+.2f}%")
+            
+            fig_m, ax_m = plt.subplots(figsize=(10, 3))
+            ax_m.plot(new_rule_rets.index, (1+old_rule_rets).cumprod(), label="従来(順張り)", color="#d62728", alpha=0.6)
+            ax_m.plot(new_rule_rets.index, (1+new_rule_rets).cumprod(), label="新(逆張り)", color="#2ca02c", linewidth=2)
+            ax_m.legend(frameon=False)
+            st.pyplot(fig_m)
+            plt.close(fig_m)
+
+        st.subheader("ドローダウン推移 (4/8 〜)")
+        running_max_p = cum_post.cummax()
+        dd_p = (cum_post - running_max_p) / running_max_p
+        fig_dd, ax_dd = plt.subplots(figsize=(12, 2))
+        ax_dd.fill_between(dd_p.index, dd_p.values * 100, 0, color="#d62728", alpha=0.3)
+        ax_dd.plot(dd_p.index, dd_p.values * 100, color="#d62728", linewidth=1)
+        st.pyplot(fig_dd)
+        plt.close(fig_dd)
+    else:
+        st.warning("4/8以降のデータがありません。")
+
+    st.markdown("---")
+
+    # 業種貢献度分析の表示
+    if not df_pnl.empty:
+        st.subheader("セクター別 損益貢献度")
+        def plot_sector(p_df, suffix):
+            if p_df.empty: return
+            p_s = p_df.groupby(['Ticker', 'Side'])['PnL'].sum().unstack(fill_value=0) * 100
+            for s in ['Long', 'Short']:
+                if s not in p_s.columns: p_s[s] = 0.0
+            p_s['Total'] = p_s['Long'] + p_s['Short']
+            p_s = p_s.sort_values('Total')
+            fig, ax = plt.subplots(figsize=(12, 6))
+            y = np.arange(len(p_s))
+            ax.barh(y, p_s['Long'], color='#2ca02c', label='Long', alpha=0.7)
+            ax.barh(y, p_s['Short'], color='#d62728', label='Short', alpha=0.7)
+            ax.set_yticks(y)
+            ax.set_yticklabels([JP_TICKER_NAMES.get(t, t) for t in p_s.index])
+            ax.set_title(f"貢献度 ({suffix})")
+            ax.legend()
+            st.pyplot(fig)
+            plt.close(fig)
+
+        plot_sector(df_pnl, "全期間")
+        plot_sector(df_pnl[df_pnl['Date'] >= pd.Timestamp("2026-04-08")], "4/8〜 構造変化後")

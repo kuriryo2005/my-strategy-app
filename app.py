@@ -1,5 +1,5 @@
 """
-Sruntreamlit Web App: 日米セクター リードラグ戦略ダッシュボード
+Streamlit Web App: 日米セクター リードラグ戦略ダッシュボード
 
 Usage:
     streamlit run app.py
@@ -48,7 +48,46 @@ from src.signal.regularized_pca import regularized_pca, rolling_standardize
 from src.portfolio.construction import construct_portfolio, construct_portfolio_with_crash_filter, construct_original_portfolio_with_crash_filter
 from src.evaluation.metrics import compute_metrics
 
-@st.cache_data(show_spinner="データを読み込み中...", ttl="12h")
+# --- 永続的なユーザー設定の管理 ---
+import json
+SETTINGS_FILE = DATA_PROCESSED / "user_settings.json"
+
+def load_user_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_user_settings(key, value):
+    settings = load_user_settings()
+    settings[key] = value
+    DATA_PROCESSED.mkdir(exist_ok=True, parents=True)
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f)
+
+# 🟢 セッション状態の初期化とコールバック関数
+user_settings = load_user_settings()
+
+if "main_capital_input" not in st.session_state:
+    st.session_state["main_capital_input"] = user_settings.get("initial_capital", 100)
+if "leverage_input" not in st.session_state:
+    st.session_state["leverage_input"] = user_settings.get("leverage", 3.0)
+if "margin_buffer_input" not in st.session_state:
+    st.session_state["margin_buffer_input"] = user_settings.get("margin_buffer", 5)
+
+def on_capital_change():
+    save_user_settings("initial_capital", st.session_state["main_capital_input"])
+
+def on_leverage_change():
+    save_user_settings("leverage", st.session_state["leverage_input"])
+
+def on_buffer_change():
+    save_user_settings("margin_buffer", st.session_state["margin_buffer_input"])
+
+@st.cache_data(ttl=0)
 def load_data():
     # DATA_PROCESSED（元々設定されているパス）を使って正しい場所を指定
     st.sidebar.info(f"Loading from: {os.path.abspath(DATA_PROCESSED)}")
@@ -57,9 +96,11 @@ def load_data():
     map_file = DATA_PROCESSED / "us_jp_date_map.csv"
     
     us_ret = pd.read_csv(us_file, index_col=0, parse_dates=True).sort_index()
+    us_ret.index = us_ret.index.normalize()
     
     # jp_returns.csv はマルチインデックスヘッダー (Ticker, ReturnType)
     jp_all = pd.read_csv(jp_file, header=[0, 1], index_col=0, parse_dates=True).sort_index()
+    jp_all.index = jp_all.index.normalize()
     
     # 🟢 JP_TICKERS に含まれる銘柄のみに制限 (除外対応)
     existing_tickers = [t for t in JP_TICKERS if t in jp_all.columns.get_level_values(0)]
@@ -69,6 +110,8 @@ def load_data():
     jp_oc = jp_all.xs("oc", axis=1, level=1)
     
     date_map = pd.read_csv(map_file, parse_dates=["us_date", "jp_next_date"])
+    date_map["us_date"] = pd.to_datetime(date_map["us_date"]).dt.normalize()
+    date_map["jp_next_date"] = pd.to_datetime(date_map["jp_next_date"]).dt.normalize()
     
     return us_ret, jp_cc, jp_oc, date_map
 from src.signal.regularized_pca import regularized_pca, rolling_standardize
@@ -183,8 +226,8 @@ def compute_all_artifacts():
     return us_tickers_cfull, C0, combined, z_scores
 
 
-@st.cache_data(show_spinner="バックテストを実行中...", ttl="12h")
-def run_pca_sub_backtest(start_date_str: str = "2022-01-01"):
+@st.cache_data(show_spinner="バックテストを実行中...", ttl=0)
+def run_pca_sub_backtest_v4(start_date_str: str = "2022-01-01", leverage: float = 3.0, force_contrarian: bool = True):
     """Run PCA_SUB backtest and return daily returns Series."""
     
     # 🟢 1. データ読み込みはこれ一行に集約します
@@ -209,7 +252,7 @@ def run_pca_sub_backtest(start_date_str: str = "2022-01-01"):
     combined = pd.concat([us, jp_aligned], axis=1).dropna()
     z_scores = rolling_standardize(combined.values, window=ROLLING_WINDOW)
 
-# Date map lookup
+    # Date map lookup
     us_to_jp = {}
     for _, row in date_map.iterrows():
         # CSVのカラム名がどうなっていても安全に取得できるように、
@@ -251,19 +294,26 @@ def run_pca_sub_backtest(start_date_str: str = "2022-01-01"):
 
         signal = pd.Series(z_hat_J, index=jp_tickers)
         
-        # --- 🟢 ハイブリッド戦略適用 (決算月は順張り) ---
+        # 🟢 モード判定 (force_contrarian引数で挙動を切り分け)
         is_earnings = jp_date.month in [2, 5, 8, 11]
+        use_contrarian_anyway = force_contrarian and (jp_date >= pd.Timestamp("2026-05-01"))
+        
         current_market_return = us.loc[us_date].mean()
         
-        # 順張りの場合はシグナルを反転させてから、ウェイト計算（除外設定を含む）に渡す
-        if is_earnings:
+        if is_earnings and not use_contrarian_anyway:
+            # 2026年5月より前（2月など）、または force_contrarian=False の決算期は「順張り」
             signal_input = -signal
         else:
+            # それ以外、および 2026年5月以降で force_contrarian=True の場合は「逆張り」
             signal_input = signal
+
+        # 卸売 (1629.T) を除外設定にする (シグナルページのデフォルトと合わせる)
+        excluded_tickers = ["1629.T"]
 
         weights = construct_portfolio_with_crash_filter(
             signal=signal_input, 
             market_return=current_market_return,
+            exclude_tickers=excluded_tickers
         )
         # --- 🟢 ここまで ---
 
@@ -285,8 +335,10 @@ def run_pca_sub_backtest(start_date_str: str = "2022-01-01"):
                 })
                 
         port_ret = individual_pnl.sum()
-        # 3.3倍レバレッジ換算 (現物1.0 + 信用2.3 を想定し、L/S各1.65倍)
-        port_ret = port_ret * 1.65
+        
+        # スライダーで指定されたレバレッジに換算 (ベースがグロス2.0のため /2.0 する)
+        scaling_factor = leverage / 2.0
+        port_ret = port_ret * scaling_factor
         daily_rets.append((jp_date, port_ret))
 
     if not daily_rets:
@@ -498,29 +550,11 @@ def find_nearest_jp_date(target, date_map, direction="backward"):
 
 
 def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
-    """Generate signal and weights for a single US date.
-    
-    一度生成したシグナルはファイルに保存し、同じ日は再計算しない。
-    これにより場中にデータ更新してもシグナルが変わらない。
-    """
-    import json
+    """Generate signal and weights for a single US date."""
     
     jp_tickers = list(JP_TICKERS)
     
-    # --- シグナル保存ディレクトリ ---
-    signal_dir = DATA_PROCESSED / "signals"
-    signal_dir.mkdir(exist_ok=True)
-    signal_file = signal_dir / f"{us_date.strftime('%Y-%m-%d')}.json"
-    
-    # --- 保存済みシグナルがあればそれを使う ---
-    if signal_file.exists():
-        with open(signal_file, "r") as f:
-            saved = json.load(f)
-        signal = pd.Series(saved["signal"])
-        weights = pd.Series(saved["weights"])
-        return signal, weights, None
-    
-    # --- なければ計算して保存 ---
+    # --- 計算を実行 ---
     window = ROLLING_WINDOW
     K = NUM_FACTORS
 
@@ -528,18 +562,22 @@ def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
         return None, None, f"US日付 {us_date.date()} はデータに存在しません"
 
     t_loc = combined.index.get_loc(us_date)
-    if t_loc < window * 2:
+    # バックテスト(run_pca_sub_backtest)の条件 t < window に合わせる
+    if t_loc < window:
         return None, None, f"ローリングウィンドウに十分なデータがありません (位置={t_loc})"
 
-    z_win = z_scores[t_loc - window : t_loc]
+    # 🟢 最新の市場構造を反映させるため、t_loc（最新日）を含めたスライスを使用
+    z_win = z_scores[t_loc - window + 1 : t_loc + 1]
+    
     if np.any(np.isnan(z_win)):
-        return None, None, "PCAウィンドウにNaNが含まれています"
+        return None, None, "PCAウィンドウ内に十分なデータ(実数)がありません"
 
     V_K = regularized_pca(z_win, C0, lam=REGULARIZATION_LAMBDA, K=K)
     n_us = len(us_tickers_cfull)
     V_U = V_K[:n_us, :]
     V_J = V_K[n_us:, :]
 
+    # 最新のUS Zスコアを、最新の空間に投影
     z_US_t = z_scores[t_loc, :n_us]
     f_t = V_U.T @ z_US_t
     z_hat_J = V_J @ f_t
@@ -547,19 +585,14 @@ def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
     signal = pd.Series(z_hat_J, index=jp_tickers)
     
     current_market_return = combined.loc[us_date].iloc[:n_us].mean()
+    
+    # 🟢 卸売(1629.T)除外をここでも明示 (バックテストと一致させる)
+    excluded = ["1629.T"]
     weights = construct_portfolio_with_crash_filter(
         signal=signal, 
         market_return=current_market_return,
+        exclude_tickers=excluded
     )
-    
-    # --- ファイルに保存（次回以降は再計算しない） ---
-    with open(signal_file, "w") as f:
-        json.dump({
-            "us_date": us_date.strftime("%Y-%m-%d"),
-            "signal": signal.to_dict(),
-            "weights": weights.to_dict(),
-            "market_return": float(current_market_return),
-        }, f, indent=2)
     
     return signal, weights, None
 
@@ -591,6 +624,26 @@ trading_days_year = st.sidebar.slider(
     value=245,
     help="日本株の年間取引日数（約245日）を設定します。"
 )
+leverage = st.sidebar.slider(
+    "レバレッジ倍率", 
+    min_value=1.0, 
+    max_value=3.3, 
+    value=st.session_state["leverage_input"], 
+    step=0.1,
+    key="leverage_input",
+    on_change=on_leverage_change
+)
+
+margin_buffer = st.sidebar.slider(
+    "注文安全バッファ (%)", 
+    min_value=0, 
+    max_value=20, 
+    value=st.session_state["margin_buffer_input"], 
+    step=1,
+    key="margin_buffer_input",
+    help="成り行き注文時の余力不足を防ぐため、計算上のレバレッジを少し下げます（推奨: 5-10%）。",
+    on_change=on_buffer_change
+)
 
 page = st.sidebar.radio(
     "ページ選択",
@@ -600,22 +653,32 @@ page = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.subheader("データ管理")
 if st.sidebar.button("データを最新に更新"):
-    with st.spinner("最新データを取得中..."):
+    with st.spinner("最新市場データを取得中...（これには1分ほどかかります）"):
         try:
-            script_path = PROJECT_ROOT / "manual_refresh.py"
-            result = subprocess.run(
-                [sys.executable, str(script_path)],
-                capture_output=True,
-                text=True,
-                check=True
-            )
+            # 外部スクリプトを叩くのではなく、内部の関数を直接呼び出す（環境問題回避）
+            from src.data.fetch_jp_etf import fetch_jp_etf
+            from src.data.fetch_us_etf import fetch_us_etf
+            from src.data.preprocess import preprocess_returns
+            from src.data.build_calendar import build_calendar
+            
+            # 1. データのダウンロード
+            fetch_jp_etf()
+            fetch_us_etf()
+            
+            # 2. リターンの再計算と保存
+            us_returns, jp_returns = preprocess_returns()
+            jp_cc = jp_returns.xs("cc", axis=1, level="ReturnType")
+            
+            # 3. カレンダーの再構築
+            build_calendar(us_returns.index, jp_cc.index)
+            
+            latest_us_date = us_returns.index[-1].strftime('%Y-%m-%d')
             st.cache_data.clear()
-            st.sidebar.success("更新完了！（シグナルは固定済みのため変わりません）")
+            st.sidebar.success(f"✅ 最新データを取得・反映しました！ (米国基準日: {latest_us_date})")
             st.rerun()
-        except subprocess.CalledProcessError as e:
-            st.sidebar.error(f"更新失敗 (Code {e.returncode}):\n{e.stderr}")
         except Exception as e:
-            st.sidebar.error(f"予期せぬエラー: {e}")
+            st.sidebar.error(f"更新エラー: {str(e)}")
+            st.sidebar.info("インターネット接続やyfinanceの制限を確認してください。")
 
 if st.sidebar.button("キャッシュをクリア"):
     st.cache_data.clear()
@@ -673,10 +736,11 @@ if page == "本日のシグナル":
             "運用元金（万円）",
             min_value=1,
             max_value=100000,
-            value=100,
+            value=st.session_state["main_capital_input"],
             step=10,
             key="main_capital_input",
-            help="この元金をベースにポジションサイズを計算します。"
+            help="この元金をベースにポジションサイズを計算します。",
+            on_change=on_capital_change
         )
     with col_cap2:
         st.info(f"現在の運用元金: **{initial_capital:,} 万円**")
@@ -703,42 +767,44 @@ if page == "本日のシグナル":
             help="日本市場での取引日を選択してください。"
         )
     with col_lev:
-        leverage = st.slider("レバレッジ倍率", min_value=1.0, max_value=3.3, value=3.0, step=0.1)
+        st.info(f"レバレッジ: **{leverage} 倍**")
+
         
     capital = initial_capital * 10000 * leverage
     target_ts = pd.Timestamp(selected_date)
     jp_date = target_ts
     us_date = find_us_date_for_jp(target_ts, date_map)
     
-    if us_date is None:
-        found_jp = find_nearest_jp_date(target_ts, date_map, direction="backward")
-        if found_jp is not None:
-            target_ts = found_jp
-            us_date = find_us_date_for_jp(target_ts, date_map)
-    
     if us_date is None or us_date not in combined.index:
-        st.error("データが見つかりません。")
-        st.stop()
+        # 見つからない場合は一番近い「過去の営業日」を探す
+        target_ts = find_nearest_jp_date(target_ts, date_map, direction="backward")
+        if target_ts is not None:
+            us_date = find_us_date_for_jp(target_ts, date_map)
+            jp_date = target_ts
+        
+        if us_date is None or us_date not in combined.index:
+            st.error(f"指定された日付（{selected_date}）付近のデータが見つかりません。")
+            st.stop()
 
     # --- 📅 戦略モードの自動判定 ---
     is_earnings_month = target_ts.month in [2, 5, 8, 11]
     
-    # 推奨モードのデフォルト設定
-    if is_earnings_month:
-        default_mode = "順張り (Momentum)"
-        mode_reason = "【決算期モード】決算発表による強いトレンドを利益に変える設定です。"
+    # 推奨モードのデフォルト設定 (常に逆張りをデフォルトにする)
+    default_mode = "逆張り (Contrarian)"
+    if is_earnings_month and target_ts < pd.Timestamp("2026-05-01"):
+        mode_reason = "【過去データ参照】この時期は従来「順張り」推奨でしたが、現在は「逆張り」を基本設定としています。"
     else:
-        default_mode = "逆張り (Contrarian)"
-        mode_reason = "【平時モード】米国市場への過剰反応からの回帰を狙う標準設定です。"
+        mode_reason = "【標準設定】現在の相場構造に基づき、逆張りをデフォルトとしています。"
 
     st.info(f"💡 **現在の推奨**: **{default_mode}** \n\n {mode_reason}")
 
-    # モード切り替え
+    # モード切り替え (keyに日付を含めることで、日付変更時や再起動時に確実にデフォルトに戻るようにする)
     strategy_mode = st.radio(
         "実行モードを選択（手動切り替え可能）",
         ["逆張り (Contrarian)", "順張り (Momentum)"],
-        index=0 if default_mode == "逆張り (Contrarian)" else 1,
-        horizontal=True
+        index=0,
+        horizontal=True,
+        key=f"strategy_mode_{selected_date}"
     )
 
     if target_ts >= pd.Timestamp("2026-04-08") and strategy_mode == "順張り (Momentum)" and not is_earnings_month:
@@ -757,6 +823,14 @@ if page == "本日のシグナル":
         """)
 
     st.markdown(f"**日本市場日付:** {selected_date} | **米国基準日:** {us_date.strftime('%Y-%m-%d')}")
+
+    with st.expander("🔍 システムデバッグ情報"):
+        st.write(f"選択された日本日: {target_ts}")
+        st.write(f"マッピングされた米国日: {us_date}")
+        st.write(f"データ全体の最終日: {combined.index[-1]}")
+        t_loc = combined.index.get_loc(us_date)
+        st.write(f"米国日のインデックス位置: {t_loc}")
+        st.write(f"PCAウィンドウ範囲: {t_loc - ROLLING_WINDOW} 〜 {t_loc}")
 
     # 1. 生シグナルの生成
     raw_signal, _, err = generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0)
@@ -778,6 +852,7 @@ if page == "本日のシグナル":
     weights = construct_portfolio_with_crash_filter(
         signal=signal_input,
         market_return=current_market_return,
+        exclude_tickers=["1629.T"]
     )
     
     # 画面表示用のシグナルと変数名調整
@@ -795,7 +870,12 @@ if page == "本日のシグナル":
     # Build display table
     rows = []
     
-    target_gross = initial_capital * 10000 * leverage
+    # 🟢 安全バッファを考慮した実効レバレッジの計算
+    effective_leverage = leverage * (1.0 - margin_buffer / 100.0)
+    target_gross = initial_capital * 10000 * effective_leverage
+    
+    st.info(f"💡 **安全バッファ適用後**: 実効レバレッジ **{effective_leverage:.2f}倍** (総枠: ¥{target_gross:,.0f})")
+    
     gross_weight_sum = weights.abs().sum()
     norm_weights = weights / gross_weight_sum if gross_weight_sum > 0 else weights
     
@@ -883,18 +963,21 @@ if page == "本日のシグナル":
         f"ネットエクスポージャー: {weights.sum():.4f}"
     )
 
-    # Actual P&L if date is in the past
-    if jp_date in jp_oc.index:
-        oc_ret = jp_oc.loc[jp_date, list(JP_TICKERS)]
+    # Actual P&L if date is available
+    # インデックスを正規化して比較を確実にする
+    search_date = jp_date.normalize()
+    if search_date in jp_oc.index:
+        oc_ret = jp_oc.loc[search_date, list(JP_TICKERS)]
         # 生のリターン (2.0倍分)
         port_ret = (weights * oc_ret).sum()
+        
         # レバレッジ係数
         leverage_factor = leverage / 2.0
         port_ret_leveraged = port_ret * leverage_factor
 
-        if pd.Timestamp.today().normalize() > jp_date:
+        if True: # データが存在すれば常に表示する
             st.markdown("---")
-            st.subheader("実績（始値→終値）")
+            st.subheader(f"実績: {selected_date}（始値→終値）")
 
             pnl_jpy = port_ret_leveraged * (initial_capital * 10000)
             col_res1, col_res2 = st.columns(2)
@@ -916,6 +999,9 @@ if page == "本日のシグナル":
                             f"{pnl * 100:+.2f}%",
                             f"¥ {int(pnl * (initial_capital * 10000)):+,}"
                         )
+
+    # --- 📊 過去の実績履歴一覧 (削除済み) ---
+    pass
 
     # ===================================================================
     # リアルタイム損益セクション (本日のポジションの含み損益)
@@ -974,9 +1060,9 @@ if page == "本日のシグナル":
                         gross_w = weights.abs().sum()
                         nw = weights / gross_w if gross_w > 0 else weights
                         
-                        # 🟢 レバレッジを明示的に定義 (3.3倍)
-                        leverage = 3.3
-                        st.sidebar.write(f"DEBUG: leverage={leverage}")
+                        # 🟢 ユーザー設定のレバレッジとバッファを適用
+                        eff_leverage = leverage * (1.0 - margin_buffer / 100.0)
+                        st.sidebar.write(f"DEBUG: effective_leverage={eff_leverage:.2f}")
                         
                         for ticker in active_tickers:
                             w = nw[ticker]
@@ -996,7 +1082,7 @@ if page == "本日のシグナル":
                             oc_return = (c_price - o_price) / o_price
                             
                             # ポジション金額 (元金 * レバレッジ を各銘柄のウェイトで配分)
-                            position_jpy = abs(w) * (initial_capital * 10000 * leverage)
+                            position_jpy = abs(w) * (initial_capital * 10000 * eff_leverage)
                             shares = max(1, int(position_jpy / o_price))
                             actual_position = shares * o_price
                             
@@ -1034,7 +1120,7 @@ if page == "本日のシグナル":
                                 st.metric("建玉合計", f"¥{total_invested:,.0f}")
                             with col_pnl3:
                                 # 🟢 購入余力の計算 (レバレッジ枠 3.3倍の残り)
-                                total_capacity = initial_capital * 10000 * leverage
+                                total_capacity = initial_capital * 10000 * eff_leverage
                                 buying_power = total_capacity - total_invested
                                 st.metric("購入余力", f"¥{buying_power:,.0f}", delta=f"{(buying_power/total_capacity*100):.1f}%")
                             
@@ -1088,7 +1174,7 @@ if page == "本日のシグナル":
     # バックテスト結果からリターン分布を取得
     try:
         # 全期間のデータを取得
-        daily_rets_full, _ = run_pca_sub_backtest(test_start_str)
+        daily_rets_full, _ = run_pca_sub_backtest_v4(test_start_str, leverage=leverage)
         
         # 🟢 シミュレーションの根拠を 2026年以降に限定
         daily_rets_sim = daily_rets_full[daily_rets_full.index >= pd.Timestamp("2026-01-01")]
@@ -1226,169 +1312,133 @@ if page == "本日のシグナル":
 elif page == "バックテスト結果":
     st.header("バックテスト結果 (PCA SUB)")
 
-    # --- 📊 セクション1: 全期間ハイブリッド実績 ---
-    st.header("1. 全期間ハイブリッド実績")
-    
-    # セクション固有の開始日選択
+    # 1. 全期間ハイブリッド実績
+    st.subheader("1. 全期間ハイブリッド実績")
     col_bt_date, _ = st.columns([1, 2])
     with col_bt_date:
-        bt_custom_start = st.date_input(
-            "表示開始日を選択",
-            value=bt_start_date,
-            key="bt_custom_start",
-            help="このセクションの分析対象期間を上書きします。"
-        )
+        bt_custom_start = st.date_input("表示開始日を選択", value=bt_start_date, key="bt_custom_start")
     test_start_str_custom = bt_custom_start.strftime("%Y-%m-%d")
     
-    # カスタム期間でバックテストを実行
-    daily_rets, df_pnl = run_pca_sub_backtest(test_start_str_custom)
+    # --- バックテスト計算 (同期実行) ---
+    with st.spinner("バックテストを多角的に分析中..."):
+        # 🟢 A. ハイブリッド (決算月は順張り / 5月以降も通常ルール)
+        daily_rets_hybrid, df_pnl_hybrid = run_pca_sub_backtest_v4(test_start_str_custom, leverage=leverage, force_contrarian=False)
+        
+        # 🟢 B. 純逆張り (5月以降は常に逆張り / 4/8以降の分析用)
+        # こちらも同じ開始日から計算することで、Zスコアの計算条件を完全に一致させます
+        daily_rets_pure_cont, df_pnl_pure_cont = run_pca_sub_backtest_v4(test_start_str_custom, leverage=leverage, force_contrarian=True)
     
-    st.markdown(f"**分析対象期間:** {test_start_str_custom} 〜")
-    st.markdown("決算月（2, 5, 8, 11月）は順張り、それ以外は逆張りで運用した実績です。")
-    
-    # 全期間の指標
-    metrics_all = compute_metrics(daily_rets)
-    # 取引が発生した日（リターン非ゼロ）のみで勝率を計算
-    active_rets = daily_rets[daily_rets != 0]
+    metrics_all = compute_metrics(daily_rets_hybrid)
+    active_rets = daily_rets_hybrid[daily_rets_hybrid != 0]
     win_rate_val = (active_rets > 0).mean() if not active_rets.empty else 0.0
 
-    col_a1, col_a2, col_a3, col_a4, col_a5 = st.columns(5)
-    with col_a1: st.metric("年率リターン (単純)", f"{metrics_all['AR'] * 100:.1f}%")
-    with col_a2: st.metric("累積リターン", f"{metrics_all['TOTAL_RETURN'] * 100:.1f}%")
-    with col_a3: st.metric("最大ドローダウン", f"{metrics_all['MDD'] * 100:.2f}%")
-    with col_a4: st.metric("リスクリターン比", f"{metrics_all['RR']:.2f}")
-    with col_a5: st.metric("勝率 (取引日ベース)", f"{win_rate_val*100:.1f}%")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("年率リターン", f"{metrics_all['AR'] * 100:.1f}%")
+    c2.metric("累積リターン", f"{metrics_all['TOTAL_RETURN'] * 100:.1f}%")
+    c3.metric("最大DD", f"{metrics_all['MDD'] * 100:.2f}%")
+    c4.metric("RR比", f"{metrics_all['RR']:.2f}")
+    c5.metric("勝率", f"{win_rate_val*100:.1f}%")
 
-    st.subheader("累積リターン推移 (1/1 〜)")
-    cum_all = (1.0 + daily_rets).cumprod()
+    st.subheader("累積リターン推移 (ハイブリッド)")
+    cum_all = (1.0 + daily_rets_hybrid).cumprod()
     fig_all, ax_all = plt.subplots(figsize=(12, 4))
-    ax_all.plot(cum_all.index, cum_all.values, color="#2ca02c", linewidth=2, label="Hybrid Strategy")
+    ax_all.plot(cum_all.index, cum_all.values, color="#2ca02c", linewidth=2)
     ax_all.axhline(y=1.0, color="grey", linestyle="--", alpha=0.5)
-    ax_all.set_ylabel("累積リターン")
-    ax_all.legend(frameon=False)
     st.pyplot(fig_all)
     plt.close(fig_all)
 
-    # 追加: 1/1〜のドローダウン
-    st.subheader("ドローダウン推移 (1/1 〜)")
-    running_max_all = cum_all.cummax()
-    dd_all = (cum_all - running_max_all) / running_max_all
-    fig_dd_all, ax_dd_all = plt.subplots(figsize=(12, 3))
-    ax_dd_all.fill_between(dd_all.index, dd_all.values * 100, 0, alpha=0.3, color="#d62728")
-    ax_dd_all.plot(dd_all.index, dd_all.values * 100, color="#d62728", linewidth=1)
-    ax_dd_all.set_ylabel("DD (%)")
-    st.pyplot(fig_dd_all)
-    plt.close(fig_dd_all)
-
     st.markdown("---")
 
-    # --- 📊 セクション2: 構造変化後の逆張り実績 (4/8 〜) ---
-    st.header("2. 構造変化後の逆張り実績 (4/8 〜)")
-    st.markdown("ユーザー様が特定した「4/8の構造変化」以降、純粋に**逆張り**として運用した場合のパフォーマンスです。")
+    # 2. 構造変化後の逆張り実績 (4/8 〜)
+    st.subheader("2. 構造変化後の逆張り実績 (4/8 〜)")
     
-    # 4/8以降を切り出し
-    rets_post_408 = daily_rets[daily_rets.index >= pd.Timestamp("2026-04-08")]
+    # 🟢 B. 4/8以降用 (逆張り固定: 決算月も逆張り)
+    # 4/8から計算を開始して、force_contrarian=True にする
+    daily_rets_pure_cont, df_pnl_pure_cont = run_pca_sub_backtest_v4("2026-04-08", leverage=leverage, force_contrarian=True)
+    rets_post_408 = daily_rets_pure_cont[daily_rets_pure_cont.index >= pd.Timestamp("2026-04-08")]
     
     if not rets_post_408.empty:
         metrics_post = compute_metrics(rets_post_408)
-        # 4/8以降も取引日ベースの勝率
-        active_rets_post = rets_post_408[rets_post_408 != 0]
-        win_rate_post = (active_rets_post > 0).mean() if not active_rets_post.empty else 0.0
-
-        col_p1, col_p2, col_p3, col_p4, col_p5 = st.columns(5)
-        with col_p1: st.metric("期間累積リターン", f"{metrics_post['TOTAL_RETURN'] * 100:.1f}%")
-        with col_p2: st.metric("平均日次 (取引日)", f"{active_rets_post.mean()*100:+.2f}%")
-        with col_p3: st.metric("最大ドローダウン", f"{metrics_post['MDD'] * 100:.2f}%")
-        with col_p4: st.metric("リスクリターン比", f"{metrics_post['RR']:.2f}")
-        with col_p5: st.metric("勝率 (取引日ベース)", f"{win_rate_post*100:.1f}%")
-
-        st.subheader("累積リターン推移 (4/8 〜)")
-        # 4/8を1.0として再スタート
         cum_post = (1.0 + rets_post_408).cumprod()
+        
+        cp1, cp2, cp3 = st.columns(3)
+        cp1.metric("期間累積", f"{metrics_post['TOTAL_RETURN'] * 100:.1f}%")
+        cp2.metric("最大DD", f"{metrics_post['MDD'] * 100:.2f}%")
+        cp3.metric("RR比", f"{metrics_post['RR']:.2f}")
+
         fig_post, ax_post = plt.subplots(figsize=(12, 4))
-        ax_post.plot(cum_post.index, cum_post.values, color="#1f77b4", linewidth=2, label="Post-4/8 Contrarian")
+        ax_post.plot(cum_post.index, cum_post.values, color="#1f77b4", linewidth=2)
         ax_post.axhline(y=1.0, color="grey", linestyle="--", alpha=0.5)
-        ax_post.set_ylabel("累積リターン")
-        ax_post.set_xlim(rets_post_408.index.min(), rets_post_408.index.max()) # X軸を限定
-        ax_post.legend(frameon=False)
         st.pyplot(fig_post)
         plt.close(fig_post)
 
-        # 追加: 4/8〜のドローダウン
+        # 🔍 2026年5月 戦略スイッチ比較分析
+        st.markdown("#### 🔍 2026年5月 戦略スイッチ比較分析")
+        
+        # 両方のデータセットを確実に5月分で抽出
+        may_start = pd.Timestamp("2026-05-01")
+        may_hybrid = daily_rets_hybrid[daily_rets_hybrid.index >= may_start]
+        may_pure = daily_rets_pure_cont[daily_rets_pure_cont.index >= may_start]
+        
+        # 共通する日付のみで比較（データの欠落を防ぐ）
+        common_idx = may_hybrid.index.intersection(may_pure.index)
+        if not common_idx.empty:
+            h_may = may_hybrid.loc[common_idx]
+            p_may = may_pure.loc[common_idx]
+            
+            h_cum = (1 + h_may).prod() - 1
+            p_cum = (1 + p_may).prod() - 1
+            
+            cm1, cm2 = st.columns(2)
+            cm1.metric("ハイブリッド (5月順張り) 累計", f"{h_cum*100:+.2f}%")
+            cm2.metric("純逆張り (5月も逆張り) 累計", f"{p_cum*100:+.2f}%", delta=f"{(p_cum-h_cum)*100:+.2f}%")
+            
+            fig_m, ax_m = plt.subplots(figsize=(10, 3))
+            ax_m.plot(h_may.index, (1+h_may).cumprod(), label="ハイブリッド (5月順張り)", color="#d62728", marker='o', markersize=4)
+            ax_m.plot(p_may.index, (1+p_may).cumprod(), label="純逆張り (5月も逆張り)", color="#2ca02c", linewidth=2, marker='s', markersize=4)
+            ax_m.axhline(y=1.0, color='grey', linestyle='--', alpha=0.5)
+            ax_m.legend(frameon=False)
+            ax_m.set_title("2026年5月 戦略別累積リターン比較")
+            plt.xticks(rotation=45)
+            st.pyplot(fig_m)
+            plt.close(fig_m)
+        else:
+            st.info("5月のデータがまだ十分ではありません。")
+
         st.subheader("ドローダウン推移 (4/8 〜)")
-        running_max_post = cum_post.cummax()
-        dd_post = (cum_post - running_max_post) / running_max_post
-        fig_dd_post, ax_dd_post = plt.subplots(figsize=(12, 3))
-        ax_dd_post.fill_between(dd_post.index, dd_post.values * 100, 0, alpha=0.3, color="#d62728")
-        ax_dd_post.plot(dd_post.index, dd_post.values * 100, color="#d62728", linewidth=1)
-        ax_dd_post.set_ylabel("DD (%)")
-        ax_dd_post.set_xlim(rets_post_408.index.min(), rets_post_408.index.max()) # X軸を限定
-        st.pyplot(fig_dd_post)
-        plt.close(fig_dd_post)
+        running_max_p = cum_post.cummax()
+        dd_p = (cum_post - running_max_p) / running_max_p
+        fig_dd, ax_dd = plt.subplots(figsize=(12, 2))
+        ax_dd.fill_between(dd_p.index, dd_p.values * 100, 0, color="#d62728", alpha=0.3)
+        ax_dd.plot(dd_p.index, dd_p.values * 100, color="#d62728", linewidth=1)
+        st.pyplot(fig_dd)
+        plt.close(fig_dd)
     else:
-        st.warning("4/8以降のデータがまだありません。")
+        st.warning("4/8以降のデータがありません。")
 
     st.markdown("---")
 
-    # --- 📊 セクター貢献度分析の共通関数 ---
-    def display_sector_contribution(pnl_df, title_suffix):
-        if pnl_df.empty:
-            return
-        
-        st.subheader(f"セクター別 損益貢献度 ({title_suffix})")
-        st.markdown(f"期間中の各セクターのロング（買い）およびショート（空売り）によるトータルの損益寄与度（％）です。")
-        
-        # 集計
-        pnl_summary = pnl_df.groupby(['Ticker', 'Side'])['PnL'].sum().unstack(fill_value=0) * 100
-        for side in ['Long', 'Short']:
-            if side not in pnl_summary.columns: pnl_summary[side] = 0.0
-            
-        pnl_summary['Total'] = pnl_summary['Long'] + pnl_summary['Short']
-        pnl_summary = pnl_summary.sort_values('Total', ascending=True)
-        
-        # グラフ
+    def plot_sector(p_df, suffix):
+        if p_df.empty: return
+        st.subheader(f"セクター別 損益貢献度 ({suffix})")
+        p_s = p_df.groupby(['Ticker', 'Side'])['PnL'].sum().unstack(fill_value=0) * 100
+        for s in ['Long', 'Short']:
+            if s not in p_s.columns: p_s[s] = 0.0
+        p_s['Total'] = p_s['Long'] + p_s['Short']
+        p_s = p_s.sort_values('Total')
         fig, ax = plt.subplots(figsize=(12, 6))
-        y_pos = np.arange(len(pnl_summary))
-        ax.barh(y_pos, pnl_summary['Long'], color='#2ca02c', label='Long Profit', alpha=0.8)
-        ax.barh(y_pos, pnl_summary['Short'], color='#d62728', label='Short Profit', alpha=0.8)
-        
-        ticker_names = [JP_TICKER_NAMES.get(t, t) for t in pnl_summary.index]
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(ticker_names)
-        ax.set_xlabel("累積損益貢献度 (%)")
-        ax.legend(frameon=False)
-        ax.axvline(x=0, color='grey', linestyle='-', linewidth=0.8)
+        y = np.arange(len(p_s))
+        ax.barh(y, p_s['Long'], color='#2ca02c', label='Long', alpha=0.7)
+        ax.barh(y, p_s['Short'], color='#d62728', label='Short', alpha=0.7)
+        ax.set_yticks(y)
+        ax.set_yticklabels([JP_TICKER_NAMES.get(t, t) for t in p_s.index])
+        ax.legend()
         st.pyplot(fig)
         plt.close(fig)
-        
-        # テーブル
-        with st.expander(f"セクター別詳細データ ({title_suffix})"):
-            def win_rate(group):
-                return (group > 0).mean() if len(group) > 0 else 0
-            
-            wr = pnl_df.groupby(['Ticker', 'Side'])['PnL'].apply(win_rate).unstack(fill_value=0)
-            for side in ['Long', 'Short']:
-                if side not in wr.columns: wr[side] = 0.0
-                
-            detail = []
-            for ticker in pnl_summary.sort_values('Total', ascending=False).index:
-                detail.append({
-                    "業種": JP_TICKER_NAMES.get(ticker, ticker),
-                    "合計貢献度": f"{pnl_summary.loc[ticker, 'Total']:+.2f}%",
-                    "ショート利益/勝率": f"{pnl_summary.loc[ticker, 'Short']:+.2f}% / {wr.loc[ticker, 'Short']*100:.1f}%",
-                    "ロング利益/勝率": f"{pnl_summary.loc[ticker, 'Long']:+.2f}% / {wr.loc[ticker, 'Long']*100:.1f}%",
-                })
-            st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
 
-    # 1. 全期間の貢献度を表示
-    if not df_pnl.empty:
-        st.markdown("---")
-        display_sector_contribution(df_pnl, "1/1〜 全期間")
-        
-        # 2. 4/8以降の貢献度を表示
-        st.markdown("---")
-        df_pnl_post = df_pnl[df_pnl['Date'] >= pd.Timestamp("2026-04-08")]
-        display_sector_contribution(df_pnl_post, "4/8〜 構造変化後")
+    if not df_pnl_hybrid.empty:
+        plot_sector(df_pnl_hybrid, "全期間(ハイブリッド)")
+        plot_sector(df_pnl_pure_cont[df_pnl_pure_cont['Date'] >= pd.Timestamp("2026-04-08")], "4/8〜(純逆張り)")
 
 
 # ===================================================================
@@ -1397,7 +1447,7 @@ elif page == "バックテスト結果":
 elif page == "直近パフォーマンス":
     st.header("直近パフォーマンス (2026/01/01 〜)")
 
-    daily_rets_all, df_pnl_all = run_pca_sub_backtest(test_start_str)
+    daily_rets_all, df_pnl_all = run_pca_sub_backtest_v4(test_start_str, leverage=leverage)
     
     # 🟢 2026/01/01 以降にフィルタリング
     recent_start = pd.Timestamp("2026-01-01")
@@ -1492,7 +1542,7 @@ elif page == "直近パフォーマンス":
     )
 
     # 各期間のデータを抽出
-    daily_rets_all, _ = run_pca_sub_backtest(test_start_str)
+    daily_rets_all, _ = run_pca_sub_backtest_v4(test_start_str, leverage=leverage, force_contrarian=False)
     
     comp_periods = {
         "2025年5月 (前回春決算)": ("2025-05-01", "2025-05-31"),
