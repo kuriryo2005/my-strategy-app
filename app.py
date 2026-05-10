@@ -694,9 +694,6 @@ if st.sidebar.button("データを最新に更新"):
             st.sidebar.success(f"✅ 最新データを取得・反映しました！ (米国基準日: {latest_us_date})")
             st.rerun()
         except Exception as e:
-            st.sidebar.error(f"更新エラー: {str(e)}")
-            st.sidebar.info("インターネット接続やyfinanceの制限を確認してください。")
-
 if st.sidebar.button("キャッシュをクリア"):
     st.cache_data.clear()
     # 🟢 保存済みシグナル（JSON）も削除
@@ -785,34 +782,41 @@ if page == "本日のシグナル":
         
     capital = initial_capital * 10000 * leverage
     target_ts = pd.Timestamp(selected_date)
-    jp_date = target_ts
-    us_date = find_us_date_for_jp(target_ts, date_map)
+    target_ts = pd.Timestamp(selected_date)
+    intended_jp_date = target_ts
+    is_auto_jump = False
+
+    # ユーザー要望: 金(4), 土(5), 日(6) の場合は、次の営業日（月曜日など）のシグナルを表示
+    if target_ts.weekday() >= 4:
+        future_ts = find_nearest_jp_date(target_ts, date_map, direction="forward")
+        if future_ts is not None:
+            intended_jp_date = future_ts
+            is_auto_jump = True
+
+    jp_date = intended_jp_date
+    us_date = find_us_date_for_jp(jp_date, date_map)
     
     if us_date is None:
-        # 1. 土日の場合は、まず「次の営業日」のシグナルがあるか見に行く
-        if target_ts.weekday() >= 5:
-            future_ts = find_nearest_jp_date(target_ts, date_map, direction="forward")
-            if future_ts is not None:
-                us_date = find_us_date_for_jp(future_ts, date_map)
-                jp_date = future_ts
-        
-        # 2. それでも None の場合（または平日で None の場合）は、米国休場と判断
-        if us_date is None:
-            st.warning(f"⚠️ {selected_date} は、米国市場休場（またはデータ未着）のため運用シグナルはありません。")
-            st.info("米国市場が休みの日は、前日のデータを引き継がず、一律で「ノーポジ（シグナルなし）」とする設定になっています。")
-            st.stop()
+        # データが見つからない場合のフォールバック（米国休場判定）
+        st.warning(f"⚠️ {jp_date.date()} は、米国市場休場（またはデータ未着）のため運用シグナルはありません。")
+        st.info("米国市場が休みの日は、前日のデータを引き継がず、一律で「ノーポジ（シグナルなし）」とする設定になっています。")
+        st.stop()
             
     # us_date が combined.index にあるか最終チェック
     if us_date not in combined.index:
-        # 過去へ遡るフォールバック（バックテスト用データの整合性確保のため）
-        target_ts_fallback = find_nearest_jp_date(target_ts, date_map, direction="backward")
+        # 過去へ遡るフォールバック（データ整合性のため）
+        target_ts_fallback = find_nearest_jp_date(jp_date, date_map, direction="backward")
         if target_ts_fallback is not None:
             us_date = find_us_date_for_jp(target_ts_fallback, date_map)
             jp_date = target_ts_fallback
             
         if us_date is None or us_date not in combined.index:
-            st.error(f"指定された日付（{selected_date}）付近のデータが見つかりません。")
+            st.error(f"指定された日付（{jp_date.date()}）のデータが見つかりません。")
             st.stop()
+
+    # ジャンプした場合は通知を表示
+    if is_auto_jump:
+        st.info(f"💡 {selected_date} は週末・休日のため、**{jp_date.date()}** に向けた最新のシグナルを表示しています。")
 
     # --- 📅 戦略モードの自動判定 ---
     is_earnings_month = target_ts.month in [2, 5, 8, 11]
