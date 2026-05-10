@@ -603,14 +603,21 @@ def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
         return None, None, "シグナルの生成に失敗しました"
 
     try:
+        # キーワード引数を使わず位置引数で渡すことで、古い定義との衝突を避ける
         weights = construct_portfolio_with_crash_filter(
-            signal=signal, 
-            market_return=current_market_return,
-            exclude_tickers=excluded
+            signal, 
+            current_market_return,
+            excluded
         )
+    except TypeError as e:
+        import traceback
+        st.error("【重大なエラー】システムの内部関数（construction.py）が古い可能性があります。")
+        st.error(f"詳細: {str(e)}")
+        st.info("GitHubに最新の src/portfolio/construction.py をプッシュしたか確認してください。")
+        st.stop()
     except Exception as e:
         import traceback
-        st.error(f"【デバッグ情報】Portfolio Construction Error at generate_signal:")
+        st.error(f"【デバッグ情報】Portfolio Construction Error:")
         st.code(traceback.format_exc())
         st.stop()
     
@@ -894,11 +901,17 @@ if page == "本日のシグナル":
         current_market_return = 0.0
     
     try:
+        # キーワード引数を使わず位置引数で渡すことで、古い定義との衝突を避ける
         weights = construct_portfolio_with_crash_filter(
-            signal=signal_input,
-            market_return=current_market_return,
-            exclude_tickers=["1629.T"]
+            signal_input,
+            current_market_return,
+            ["1629.T"]
         )
+    except TypeError as e:
+        st.error("【重大なエラー】システムの内部関数（construction.py）が古い可能性があります。")
+        st.error(f"詳細: {str(e)}")
+        st.info("GitHubに最新の src/portfolio/construction.py をプッシュしたか確認してください。")
+        st.stop()
     except Exception as e:
         import traceback
         st.error(f"【デバッグ情報】Portfolio Construction Error at main body:")
