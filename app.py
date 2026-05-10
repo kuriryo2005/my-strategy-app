@@ -751,11 +751,7 @@ if page == "本日のシグナル":
     # Date picker
     jp_dates = pd.DatetimeIndex(date_map["jp_next_date"].sort_values().unique())
     today_jst = pd.Timestamp.today(tz="Asia/Tokyo").normalize().tz_localize(None)
-    
     default_jp = today_jst
-    if default_jp not in jp_dates:
-        candidates = jp_dates[jp_dates <= today_jst]
-        default_jp = candidates[-1] if not candidates.empty else jp_dates[-1]
 
     col_date, col_lev = st.columns([1.2, 1])
     with col_date:
@@ -775,13 +771,28 @@ if page == "本日のシグナル":
     jp_date = target_ts
     us_date = find_us_date_for_jp(target_ts, date_map)
     
-    if us_date is None or us_date not in combined.index:
-        # 見つからない場合は一番近い「過去の営業日」を探す
-        target_ts = find_nearest_jp_date(target_ts, date_map, direction="backward")
-        if target_ts is not None:
-            us_date = find_us_date_for_jp(target_ts, date_map)
-            jp_date = target_ts
+    if us_date is None:
+        # 1. 土日の場合は、まず「次の営業日」のシグナルがあるか見に行く
+        if target_ts.weekday() >= 5:
+            future_ts = find_nearest_jp_date(target_ts, date_map, direction="forward")
+            if future_ts is not None:
+                us_date = find_us_date_for_jp(future_ts, date_map)
+                jp_date = future_ts
         
+        # 2. それでも None の場合（または平日で None の場合）は、米国休場と判断
+        if us_date is None:
+            st.warning(f"⚠️ {selected_date} は、米国市場休場（またはデータ未着）のため運用シグナルはありません。")
+            st.info("米国市場が休みの日は、前日のデータを引き継がず、一律で「ノーポジ（シグナルなし）」とする設定になっています。")
+            st.stop()
+            
+    # us_date が combined.index にあるか最終チェック
+    if us_date not in combined.index:
+        # 過去へ遡るフォールバック（バックテスト用データの整合性確保のため）
+        target_ts_fallback = find_nearest_jp_date(target_ts, date_map, direction="backward")
+        if target_ts_fallback is not None:
+            us_date = find_us_date_for_jp(target_ts_fallback, date_map)
+            jp_date = target_ts_fallback
+            
         if us_date is None or us_date not in combined.index:
             st.error(f"指定された日付（{selected_date}）付近のデータが見つかりません。")
             st.stop()
@@ -966,7 +977,18 @@ if page == "本日のシグナル":
     # Actual P&L if date is available
     # インデックスを正規化して比較を確実にする
     search_date = jp_date.normalize()
-    if search_date in jp_oc.index:
+    
+    # 🟢 実績を表示して良いか判定（15:00の大引けを過ぎているか、あるいは過去日か）
+    now_jst = pd.Timestamp.now(tz="Asia/Tokyo")
+    today_norm = now_jst.normalize().tz_localize(None)
+    
+    is_past_day = (search_date < today_norm)
+    is_today_after_close = (search_date == today_norm and (now_jst.hour > 15 or (now_jst.hour == 15 and now_jst.minute >= 30)))
+    
+    # 実績表示を表示するかどうかのフラグ
+    show_actual_results = (search_date in jp_oc.index) and (is_past_day or is_today_after_close)
+
+    if show_actual_results:
         oc_ret = jp_oc.loc[search_date, list(JP_TICKERS)]
         # 生のリターン (2.0倍分)
         port_ret = (weights * oc_ret).sum()
@@ -977,7 +999,7 @@ if page == "本日のシグナル":
 
         if True: # データが存在すれば常に表示する
             st.markdown("---")
-            st.subheader(f"実績: {selected_date}（始値→終値）")
+            st.subheader(f"実績: {search_date.strftime('%Y-%m-%d')}（始値→終値）")
 
             pnl_jpy = port_ret_leveraged * (initial_capital * 10000)
             col_res1, col_res2 = st.columns(2)
@@ -1006,11 +1028,14 @@ if page == "本日のシグナル":
     # ===================================================================
     # リアルタイム損益セクション (本日のポジションの含み損益)
     # ===================================================================
-    # 本日の日付が選択されている場合にリアルタイム損益を表示
-    today_norm = pd.Timestamp.today(tz="Asia/Tokyo").normalize().tz_localize(None)
+    # 営業日（月〜金）の9時以降かつ、本日の日付が選択されている場合にリアルタイム損益を表示
+    now_jst = pd.Timestamp.now(tz="Asia/Tokyo")
+    today_norm = now_jst.normalize().tz_localize(None)
     is_today = (pd.Timestamp(selected_date) == today_norm)
-    
-    if is_today and weights is not None:
+    is_weekday = now_jst.weekday() < 5
+    is_after_9am = now_jst.hour >= 9
+
+    if is_today and is_weekday and is_after_9am and weights is not None:
         st.markdown("---")
         st.subheader("📊 本日のリアルタイム損益")
         
