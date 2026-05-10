@@ -694,6 +694,9 @@ if st.sidebar.button("データを最新に更新"):
             st.sidebar.success(f"✅ 最新データを取得・反映しました！ (米国基準日: {latest_us_date})")
             st.rerun()
         except Exception as e:
+            st.sidebar.error(f"更新エラー: {str(e)}")
+            st.sidebar.info("インターネット接続やyfinanceの制限を確認してください。")
+
 if st.sidebar.button("キャッシュをクリア"):
     st.cache_data.clear()
     # 🟢 保存済みシグナル（JSON）も削除
