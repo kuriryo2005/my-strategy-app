@@ -584,10 +584,21 @@ def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
 
     signal = pd.Series(z_hat_J, index=jp_tickers)
     
-    current_market_return = combined.loc[us_date].iloc[:n_us].mean()
+    # 確実にスカラ値（float）として取得
+    try:
+        val = combined.loc[us_date]
+        if isinstance(val, pd.DataFrame):
+            val = val.mean()
+        current_market_return = float(val.iloc[:n_us].mean())
+    except:
+        current_market_return = 0.0
     
     # 🟢 卸売(1629.T)除外をここでも明示 (バックテストと一致させる)
     excluded = ["1629.T"]
+    
+    if signal is None:
+        return None, None, "シグナルの生成に失敗しました"
+
     weights = construct_portfolio_with_crash_filter(
         signal=signal, 
         market_return=current_market_return,
@@ -858,7 +869,13 @@ if page == "本日のシグナル":
     # 3. 🟢 反転後のシグナルに対して、正しい除外設定を適用してウェイトを再計算
     # market_return は combined から算出
     n_us = len(us_tickers_cfull)
-    current_market_return = combined.loc[us_date].iloc[:n_us].mean()
+    try:
+        val = combined.loc[us_date]
+        if isinstance(val, pd.DataFrame):
+            val = val.mean()
+        current_market_return = float(val.iloc[:n_us].mean())
+    except:
+        current_market_return = 0.0
     
     weights = construct_portfolio_with_crash_filter(
         signal=signal_input,
