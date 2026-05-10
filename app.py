@@ -79,13 +79,16 @@ if "margin_buffer_input" not in st.session_state:
     st.session_state["margin_buffer_input"] = user_settings.get("margin_buffer", 5)
 
 def on_capital_change():
-    save_user_settings("initial_capital", st.session_state["main_capital_input"])
+    if "main_capital_input" in st.session_state:
+        save_user_settings("initial_capital", st.session_state["main_capital_input"])
 
 def on_leverage_change():
-    save_user_settings("leverage", st.session_state["leverage_input"])
+    if "leverage_input" in st.session_state:
+        save_user_settings("leverage", st.session_state["leverage_input"])
 
 def on_buffer_change():
-    save_user_settings("margin_buffer", st.session_state["margin_buffer_input"])
+    if "margin_buffer_input" in st.session_state:
+        save_user_settings("margin_buffer", st.session_state["margin_buffer_input"])
 
 @st.cache_data(ttl=0)
 def load_data():
