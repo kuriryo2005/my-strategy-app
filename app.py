@@ -599,11 +599,17 @@ def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
     if signal is None:
         return None, None, "シグナルの生成に失敗しました"
 
-    weights = construct_portfolio_with_crash_filter(
-        signal=signal, 
-        market_return=current_market_return,
-        exclude_tickers=excluded
-    )
+    try:
+        weights = construct_portfolio_with_crash_filter(
+            signal=signal, 
+            market_return=current_market_return,
+            exclude_tickers=excluded
+        )
+    except Exception as e:
+        import traceback
+        st.error(f"【デバッグ情報】Portfolio Construction Error at generate_signal:")
+        st.code(traceback.format_exc())
+        st.stop()
     
     return signal, weights, None
 
@@ -877,11 +883,17 @@ if page == "本日のシグナル":
     except:
         current_market_return = 0.0
     
-    weights = construct_portfolio_with_crash_filter(
-        signal=signal_input,
-        market_return=current_market_return,
-        exclude_tickers=["1629.T"]
-    )
+    try:
+        weights = construct_portfolio_with_crash_filter(
+            signal=signal_input,
+            market_return=current_market_return,
+            exclude_tickers=["1629.T"]
+        )
+    except Exception as e:
+        import traceback
+        st.error(f"【デバッグ情報】Portfolio Construction Error at main body:")
+        st.code(traceback.format_exc())
+        st.stop()
     
     # 画面表示用のシグナルと変数名調整
     signal = signal_input
