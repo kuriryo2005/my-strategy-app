@@ -45,7 +45,50 @@ from src.config import (
 )
 from src.signal.prior_subspace import build_prior_subspace, compute_cfull
 from src.signal.regularized_pca import regularized_pca, rolling_standardize
-from src.portfolio.construction import construct_portfolio, construct_portfolio_with_crash_filter, construct_original_portfolio_with_crash_filter
+from src.portfolio.construction import construct_portfolio, construct_original_portfolio_with_crash_filter
+
+# 🟢 ポートフォリオ構築ロジックの固定化 (クラウド環境との整合性を強制)
+def construct_portfolio_with_crash_filter(
+    signal: pd.Series,
+    market_return: float,
+    exclude_tickers: list = None,
+    **kwargs
+):
+    """2対2の固定配分ポートフォリオ構築（1/4ずつ配分）"""
+    # 除外リストの設定
+    long_exclude = ["1618.T"] + (exclude_tickers or [])
+    short_exclude = ["1617.T", "1621.T"] + (exclude_tickers or [])
+    
+    sorted_signal = signal.sort_values(ascending=False)
+    n_long, n_short = 2, 2
+    weights = pd.Series(0.0, index=signal.index)
+    
+    # Short側: Zスコア上位（買い群集）をショート
+    h_selected = []
+    for ticker in sorted_signal.index:
+        if ticker in short_exclude:
+            continue
+        h_selected.append(ticker)
+        if len(h_selected) >= n_short:
+            break
+            
+    # Long側: Zスコア下位（売り群集）をロング
+    t_selected = []
+    for ticker in sorted_signal.sort_values(ascending=True).index:
+        if ticker in long_exclude:
+            continue
+        t_selected.append(ticker)
+        if len(t_selected) >= n_long:
+            break
+            
+    # 均等配分: 各銘柄に一律のウェイトを割り当てる (2対2なので各 0.5, 合計グロス 2.0)
+    if h_selected:
+        weights.loc[h_selected] = -0.5
+    if t_selected:
+        weights.loc[t_selected] = 0.5
+        
+    return weights
+
 from src.evaluation.metrics import compute_metrics
 
 # --- 永続的なユーザー設定の管理 ---
@@ -118,7 +161,6 @@ def load_data():
     
     return us_ret, jp_cc, jp_oc, date_map
 from src.signal.regularized_pca import regularized_pca, rolling_standardize
-from src.portfolio.construction import construct_portfolio, construct_portfolio_with_crash_filter, construct_original_portfolio_with_crash_filter
 from src.evaluation.metrics import compute_metrics
 
 # ---------------------------------------------------------------------------
@@ -301,7 +343,14 @@ def run_pca_sub_backtest_v4(start_date_str: str = "2022-01-01", leverage: float 
         is_earnings = jp_date.month in [2, 5, 8, 11]
         use_contrarian_anyway = force_contrarian and (jp_date >= pd.Timestamp("2026-05-01"))
         
-        current_market_return = us.loc[us_date].mean()
+        # 🟢 current_market_returnを確実にスカラー値（float）にする
+        try:
+            val = us.loc[us_date]
+            if isinstance(val, pd.DataFrame):
+                val = val.mean()
+            current_market_return = float(val.mean())
+        except Exception:
+            current_market_return = 0.0
         
         if is_earnings and not use_contrarian_anyway:
             # 2026年5月より前（2月など）、または force_contrarian=False の決算期は「順張り」
@@ -431,7 +480,14 @@ def run_monitoring_metrics():
         z_hat_J = V_J @ f_t
 
         signal = pd.Series(z_hat_J, index=jp_tickers)
-        current_market_return = us.loc[us_date].mean()
+        # 🟢 current_market_returnを確実にスカラー値（float）にする
+        try:
+            val = us.loc[us_date]
+            if isinstance(val, pd.DataFrame):
+                val = val.mean()
+            current_market_return = float(val.mean())
+        except Exception:
+            current_market_return = 0.0
         
         # 元の戦略のウェイトを計算 (Long5, Short5, 順張り)
         weights = construct_original_portfolio_with_crash_filter(
@@ -555,6 +611,9 @@ def find_nearest_jp_date(target, date_map, direction="backward"):
 def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
     """Generate signal and weights for a single US date."""
     
+    # 🟢 内部関数を使用することを明示的に保証
+    _func = construct_portfolio_with_crash_filter
+    
     jp_tickers = list(JP_TICKERS)
     
     # --- 計算を実行 ---
@@ -639,8 +698,18 @@ bt_start_date = st.sidebar.date_input(
     max_value=pd.Timestamp.today().date(),
     help="この日付以降のデータを用いて実績およびシミュレーションを計算します。"
 )
+
+# 🟢 date_input がタプルを返す場合（範囲選択中など）の安全な処理
+if isinstance(bt_start_date, (tuple, list)):
+    if len(bt_start_date) > 0:
+        actual_bt_start_date = bt_start_date[0]
+    else:
+        actual_bt_start_date = pd.Timestamp("2022-01-01").date()
+else:
+    actual_bt_start_date = bt_start_date
+
 # config の TEST_START を上書き
-test_start_str = bt_start_date.strftime("%Y-%m-%d")
+test_start_str = actual_bt_start_date.strftime("%Y-%m-%d")
 
 # --- 💰 運用・シミュレーション設定 ---
 st.sidebar.subheader("💰 運用・資金設定")
@@ -798,9 +867,19 @@ if page == "本日のシグナル":
     target_ts = pd.Timestamp(selected_date)
     intended_jp_date = target_ts
     is_auto_jump = False
+    now_jst = pd.Timestamp.now(tz="Asia/Tokyo")
 
-    # ユーザー要望: 金(4), 土(5), 日(6) の場合は、次の営業日（月曜日など）のシグナルを表示
-    if target_ts.weekday() >= 4:
+    # ユーザー要望: 週末・休日の場合は次の営業日（月曜日など）のシグナルを表示
+    should_jump = False
+    if target_ts.weekday() >= 5:
+        # 土日は無条件でジャンプ
+        should_jump = True
+    elif target_ts.weekday() == 4 and target_ts.date() == now_jst.date():
+        # 本日の金曜日の場合、引け（15:30）以降であれば来週月曜へジャンプ
+        if now_jst.hour > 15 or (now_jst.hour == 15 and now_jst.minute >= 30):
+            should_jump = True
+
+    if should_jump:
         future_ts = find_nearest_jp_date(target_ts, date_map, direction="forward")
         if future_ts is not None:
             intended_jp_date = future_ts
