@@ -114,6 +114,76 @@ def save_user_settings(key, value):
 # 🟢 セッション状態の初期化とコールバック関数
 user_settings = load_user_settings()
 
+# --- 永続的なデータ更新ログの管理 ---
+UPDATE_LOG_FILE = DATA_PROCESSED / "data_update_log.json"
+
+def load_data_update_time():
+    if UPDATE_LOG_FILE.exists():
+        try:
+            with open(UPDATE_LOG_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("last_update_time")
+        except:
+            return None
+    return None
+
+def save_data_update_time():
+    DATA_PROCESSED.mkdir(exist_ok=True, parents=True)
+    now_str = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).isoformat()
+    try:
+        with open(UPDATE_LOG_FILE, "w") as f:
+            json.dump({"last_update_time": now_str}, f)
+    except:
+        pass
+
+if "data_updated_this_session" not in st.session_state:
+    st.session_state["data_updated_this_session"] = False
+
+# 🟢 データ取得が必要かどうかの判定 (セッション状態＋経過時間＋日付チェック)
+need_update = False
+if not st.session_state["data_updated_this_session"]:
+    need_update = True
+else:
+    last_update = load_data_update_time()
+    if last_update is not None:
+        try:
+            last_update_ts = pd.Timestamp(last_update)
+            now_jst = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None)
+            # 日付が変わっているか、または最後の更新から3時間以上経過している場合
+            if last_update_ts.date() < now_jst.date() or (now_jst - last_update_ts).total_seconds() > 3 * 3600:
+                need_update = True
+        except:
+            need_update = True
+    else:
+        need_update = True
+
+if need_update:
+    with st.spinner("初期化中... 最新の市場データを取得しています（一括ダウンロードのため数秒で完了します）"):
+        try:
+            from src.data.fetch_jp_etf import fetch_jp_etf
+            from src.data.fetch_us_etf import fetch_us_etf
+            from src.data.preprocess import preprocess_returns
+            from src.data.build_calendar import build_calendar
+            
+            fetch_jp_etf()
+            fetch_us_etf()
+            us_returns, jp_returns = preprocess_returns()
+            jp_cc = jp_returns.xs("cc", axis=1, level="ReturnType")
+            build_calendar(us_returns.index, jp_cc.index)
+            
+            # 🟢 成功時のみキャッシュをクリアし、最終更新日時を記録し、完了フラグをTrueにする
+            st.cache_data.clear()
+            save_data_update_time()
+            st.session_state["data_updated_this_session"] = True
+            st.sidebar.success("✅ 最新の市場データを取得・反映しました！")
+        except Exception as e:
+            st.sidebar.error(f"❌ 初期データ更新エラー: {str(e)}")
+            st.sidebar.info("Yahoo Financeの一時的な制限等の可能性があります。以下のボタンから再試行できます。")
+            if st.sidebar.button("データを再取得する"):
+                st.cache_data.clear()
+                st.session_state["data_updated_this_session"] = False
+                st.rerun()
+
 if "main_capital_input" not in st.session_state:
     st.session_state["main_capital_input"] = user_settings.get("initial_capital", 100)
 if "leverage_input" not in st.session_state:
@@ -238,7 +308,7 @@ def load_jp_ohlcv():
 
 @st.cache_data(show_spinner="Cfull/V0/C0/z-scoreを計算中...", ttl="12h")
 
-def compute_all_artifacts():
+def compute_all_artifacts(version=2):
     """Compute Cfull, V0, C0, combined returns, z-scores (all heavy work)."""
     us_ret = pd.read_csv(
         DATA_PROCESSED / "us_returns.csv", index_col=0, parse_dates=True,
@@ -272,7 +342,7 @@ def compute_all_artifacts():
 
 
 @st.cache_data(show_spinner="バックテストを実行中...", ttl=0)
-def run_pca_sub_backtest_v4(start_date_str: str = "2022-01-01", leverage: float = 3.0, force_contrarian: bool = True):
+def run_pca_sub_backtest_v4(start_date_str: str = "2022-01-01", leverage: float = 3.0, force_contrarian: bool = True, exclude_friday: bool = True):
     """Run PCA_SUB backtest and return daily returns Series."""
     
     # 🟢 1. データ読み込みはこれ一行に集約します
@@ -338,6 +408,10 @@ def run_pca_sub_backtest_v4(start_date_str: str = "2022-01-01", leverage: float 
         z_hat_J = V_J @ f_t
 
         signal = pd.Series(z_hat_J, index=jp_tickers)
+        
+        # 🟢 金曜日の取引を除外
+        if exclude_friday and jp_date.dayofweek == 4:
+            continue
         
         # 🟢 モード判定 (force_contrarian引数で挙動を切り分け)
         is_earnings = jp_date.month in [2, 5, 8, 11]
@@ -628,8 +702,8 @@ def generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0):
     if t_loc < window:
         return None, None, f"ローリングウィンドウに十分なデータがありません (位置={t_loc})"
 
-    # 🟢 最新の市場構造を反映させるため、t_loc（最新日）を含めたスライスを使用
-    z_win = z_scores[t_loc - window + 1 : t_loc + 1]
+    # 🟢 バックテストと完全に一致させるため、予測対象日（t_loc）を含まない過去の窓からPCA空間を構築
+    z_win = z_scores[t_loc - window : t_loc]
     
     if np.any(np.isnan(z_win)):
         return None, None, "PCAウィンドウ内に十分なデータ(実数)がありません"
@@ -741,6 +815,12 @@ margin_buffer = st.sidebar.slider(
     on_change=on_buffer_change
 )
 
+exclude_friday = st.sidebar.checkbox(
+    "金曜日の取引を除外する (推奨)", 
+    value=True, 
+    help="ディープアナリシスの結果、金曜日は市場の構造が異なりパフォーマンスが悪化する傾向があるため、除外を推奨します。"
+)
+
 page = st.sidebar.radio(
     "ページ選択",
     ["本日のシグナル", "バックテスト結果", "直近パフォーマンス", "群集行動モニタリング"],
@@ -842,7 +922,7 @@ if page == "本日のシグナル":
         st.info(f"現在の運用元金: **{initial_capital:,} 万円**")
 
     # Compute heavy artifacts (cached)
-    us_tickers_cfull, C0, combined, z_scores = compute_all_artifacts()
+    us_tickers_cfull, C0, combined, z_scores = compute_all_artifacts(version=2)
 
     # Date picker
     jp_dates = pd.DatetimeIndex(date_map["jp_next_date"].sort_values().unique())
@@ -894,31 +974,44 @@ if page == "本日のシグナル":
         st.info("米国市場が休みの日は、前日のデータを引き継がず、一律で「ノーポジ（シグナルなし）」とする設定になっています。")
         st.stop()
             
-    # us_date が combined.index にあるか最終チェック
-    if us_date not in combined.index:
-        # 過去へ遡るフォールバック（データ整合性のため）
-        target_ts_fallback = find_nearest_jp_date(jp_date, date_map, direction="backward")
+    # us_date が combined.index にあるか最終チェック（ループで遡る）
+    loop_count = 0
+    max_loops = 10
+    original_jp_date = jp_date
+    
+    while (us_date is None or us_date not in combined.index) and loop_count < max_loops:
+        loop_count += 1
+        # 厳密に前の営業日を探索するため、jp_date - 1日を指定
+        target_ts_fallback = find_nearest_jp_date(jp_date - pd.Timedelta(days=1), date_map, direction="backward")
         if target_ts_fallback is not None:
             us_date = find_us_date_for_jp(target_ts_fallback, date_map)
             jp_date = target_ts_fallback
+        else:
+            break
             
-        if us_date is None or us_date not in combined.index:
-            st.error(f"指定された日付（{jp_date.date()}）のデータが見つかりません。")
-            st.stop()
+    if us_date is None or us_date not in combined.index:
+        st.error(f"指定された日付（{original_jp_date.date()}）付近のデータが見つかりません。サイドバーから最新データを取得してください。")
+        st.stop()
 
-    # ジャンプした場合は通知を表示
-    if is_auto_jump:
+    # フォールバックまたはジャンプした場合は通知を表示
+    if jp_date != intended_jp_date:
+        st.warning(f"⚠️ 指定された日付のデータが未着のため、過去の直近取引日（**{jp_date.date()}** / 米国基準日: **{us_date.strftime('%Y-%m-%d')}**）のシグナルを表示しています。")
+    elif is_auto_jump:
         st.info(f"💡 {selected_date} は週末・休日のため、**{jp_date.date()}** に向けた最新のシグナルを表示しています。")
 
-    # --- 📅 戦略モードの自動判定 ---
+    # 🟢 バックテスト（run_pca_sub_backtest）のロジックと完全に同期させるため、
+    # 2026年5月より前の決算期（2月など）は「順張り (index=1)」、それ以外は「逆張り (index=0)」を初期値とする
     is_earnings_month = target_ts.month in [2, 5, 8, 11]
+    is_before_may_2026 = target_ts < pd.Timestamp("2026-05-01")
     
-    # 推奨モードのデフォルト設定 (常に逆張りをデフォルトにする)
-    default_mode = "逆張り (Contrarian)"
-    if is_earnings_month and target_ts < pd.Timestamp("2026-05-01"):
-        mode_reason = "【過去データ参照】この時期は従来「順張り」推奨でしたが、現在は「逆張り」を基本設定としています。"
+    if is_earnings_month and is_before_may_2026:
+        default_mode = "順張り (Momentum)"
+        strategy_index = 1
+        mode_reason = "【過去データ参照】2026年5月より前の決算期は、バックテスト検証時に「順張り」が適用されているため、初期選択を「順張り」に設定しています。"
     else:
-        mode_reason = "【標準設定】現在の相場構造に基づき、逆張りをデフォルトとしています。"
+        default_mode = "逆張り (Contrarian)"
+        strategy_index = 0
+        mode_reason = "【標準設定】現在の相場構造（4/8の構造変化以降）に基づき、逆張りを初期選択としています。"
 
     st.info(f"💡 **現在の推奨**: **{default_mode}** \n\n {mode_reason}")
 
@@ -926,7 +1019,7 @@ if page == "本日のシグナル":
     strategy_mode = st.radio(
         "実行モードを選択（手動切り替え可能）",
         ["逆張り (Contrarian)", "順張り (Momentum)"],
-        index=0,
+        index=strategy_index,
         horizontal=True,
         key=f"strategy_mode_{selected_date}"
     )
@@ -960,6 +1053,12 @@ if page == "本日のシグナル":
     raw_signal, _, err = generate_signal(us_date, combined, z_scores, us_tickers_cfull, C0)
     if err:
         st.error(err)
+        st.stop()
+
+    # 🟢 金曜日の取引除外チェック
+    if exclude_friday and jp_date.dayofweek == 4:
+        st.warning(f"⚠️ 本日（{jp_date.strftime('%Y-%m-%d')} 金曜日）は、設定により取引が除外されています。")
+        st.info("バックテストアナリシスの結果、金曜日は戦略の優位性が低下するため、取引の見送りが推奨されています。（サイドバーの設定から解除可能です）")
         st.stop()
 
     # 2. 🟢 戦略モードに応じてシグナルの極性を決定
@@ -1330,7 +1429,7 @@ if page == "本日のシグナル":
     # バックテスト結果からリターン分布を取得
     try:
         # 全期間のデータを取得
-        daily_rets_full, _ = run_pca_sub_backtest_v4(test_start_str, leverage=leverage)
+        daily_rets_full, _ = run_pca_sub_backtest_v4(test_start_str, leverage=leverage, exclude_friday=exclude_friday)
         
         # 🟢 シミュレーションの根拠を 2026年以降に限定
         daily_rets_sim = daily_rets_full[daily_rets_full.index >= pd.Timestamp("2026-01-01")]
@@ -1478,11 +1577,11 @@ elif page == "バックテスト結果":
     # --- バックテスト計算 (同期実行) ---
     with st.spinner("バックテストを多角的に分析中..."):
         # 🟢 A. ハイブリッド (決算月は順張り / 5月以降も通常ルール)
-        daily_rets_hybrid, df_pnl_hybrid = run_pca_sub_backtest_v4(test_start_str_custom, leverage=leverage, force_contrarian=False)
+        daily_rets_hybrid, df_pnl_hybrid = run_pca_sub_backtest_v4(test_start_str_custom, leverage=leverage, force_contrarian=False, exclude_friday=exclude_friday)
         
         # 🟢 B. 純逆張り (5月以降は常に逆張り / 4/8以降の分析用)
         # こちらも同じ開始日から計算することで、Zスコアの計算条件を完全に一致させます
-        daily_rets_pure_cont, df_pnl_pure_cont = run_pca_sub_backtest_v4(test_start_str_custom, leverage=leverage, force_contrarian=True)
+        daily_rets_pure_cont, df_pnl_pure_cont = run_pca_sub_backtest_v4(test_start_str_custom, leverage=leverage, force_contrarian=True, exclude_friday=exclude_friday)
     
     metrics_all = compute_metrics(daily_rets_hybrid)
     active_rets = daily_rets_hybrid[daily_rets_hybrid != 0]
@@ -1510,7 +1609,7 @@ elif page == "バックテスト結果":
     
     # 🟢 B. 4/8以降用 (逆張り固定: 決算月も逆張り)
     # 4/8から計算を開始して、force_contrarian=True にする
-    daily_rets_pure_cont, df_pnl_pure_cont = run_pca_sub_backtest_v4("2026-04-08", leverage=leverage, force_contrarian=True)
+    daily_rets_pure_cont, df_pnl_pure_cont = run_pca_sub_backtest_v4("2026-04-08", leverage=leverage, force_contrarian=True, exclude_friday=exclude_friday)
     rets_post_408 = daily_rets_pure_cont[daily_rets_pure_cont.index >= pd.Timestamp("2026-04-08")]
     
     if not rets_post_408.empty:
@@ -1603,7 +1702,7 @@ elif page == "バックテスト結果":
 elif page == "直近パフォーマンス":
     st.header("直近パフォーマンス (2026/01/01 〜)")
 
-    daily_rets_all, df_pnl_all = run_pca_sub_backtest_v4(test_start_str, leverage=leverage)
+    daily_rets_all, df_pnl_all = run_pca_sub_backtest_v4(test_start_str, leverage=leverage, exclude_friday=exclude_friday)
     
     # 🟢 2026/01/01 以降にフィルタリング
     recent_start = pd.Timestamp("2026-01-01")
@@ -1698,7 +1797,7 @@ elif page == "直近パフォーマンス":
     )
 
     # 各期間のデータを抽出
-    daily_rets_all, _ = run_pca_sub_backtest_v4(test_start_str, leverage=leverage, force_contrarian=False)
+    daily_rets_all, _ = run_pca_sub_backtest_v4(test_start_str, leverage=leverage, force_contrarian=False, exclude_friday=exclude_friday)
     
     comp_periods = {
         "2025年5月 (前回春決算)": ("2025-05-01", "2025-05-31"),
