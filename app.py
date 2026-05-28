@@ -816,9 +816,9 @@ margin_buffer = st.sidebar.slider(
 )
 
 exclude_friday = st.sidebar.checkbox(
-    "金曜日の取引を除外する (推奨)", 
-    value=True, 
-    help="ディープアナリシスの結果、金曜日は市場の構造が異なりパフォーマンスが悪化する傾向があるため、除外を推奨します。"
+    "金曜日の取引を除外する", 
+    value=False, 
+    help="直近のバックテスト（2026/4/8〜）では、金曜日も逆張りで取引する方がパフォーマンスが向上しています。除外したい場合はチェックを入れてください。"
 )
 
 page = st.sidebar.radio(
@@ -1220,37 +1220,90 @@ if page == "本日のシグナル":
 
     if show_actual_results:
         oc_ret = jp_oc.loc[search_date, list(JP_TICKERS)]
-        # 生のリターン (2.0倍分)
-        port_ret = (weights * oc_ret).sum()
         
-        # レバレッジ係数
-        leverage_factor = leverage / 2.0
-        port_ret_leveraged = port_ret * leverage_factor
-
-        if True: # データが存在すれば常に表示する
-            st.markdown("---")
-            st.subheader(f"実績: {search_date.strftime('%Y-%m-%d')}（始値→終値）")
-
-            pnl_jpy = port_ret_leveraged * (initial_capital * 10000)
-            col_res1, col_res2 = st.columns(2)
-            with col_res1:
-                st.metric("ポートフォリオリターン", f"{port_ret_leveraged * 100:+.4f}%")
-            with col_res2:
-                st.metric("損益（円）", f"{pnl_jpy:+,.0f}")
-                
-            st.markdown("**セクター別 損益寄与 (Top 4)**")
-            # 寄与度にもレバレッジを適用
-            individual_pnl = (weights * oc_ret * leverage_factor).replace(0, np.nan).dropna().sort_values(ascending=False)
+        # 🟢 リアルタイム損益セクションと同じ実効レバレッジを使用
+        eff_leverage_actual = leverage * (1.0 - margin_buffer / 100.0)
+        
+        # 🟢 株数ベースの実額計算（リアルタイム損益セクションと同じロジック）
+        gross_w_actual = weights.abs().sum()
+        nw_actual = weights / gross_w_actual if gross_w_actual > 0 else weights
+        
+        total_pnl_actual = 0.0
+        total_invested_actual = 0.0
+        individual_pnl_actual = {}
+        
+        # OHLCVから当日の始値を取得
+        ohlcv_actual = load_jp_ohlcv()
+        open_prices_actual = None
+        if ohlcv_actual is not None:
+            try:
+                col_names_a = ohlcv_actual.columns.names
+                level1_vals_a = ohlcv_actual.columns.get_level_values(1).unique().tolist()
+                price_level_a = 1 if 'Open' in level1_vals_a else 0
+                open_df_actual = ohlcv_actual.xs('Open', level=price_level_a, axis=1)
+                close_df_actual = ohlcv_actual.xs('Close', level=price_level_a, axis=1)
+                if search_date in open_df_actual.index and search_date in close_df_actual.index:
+                    open_prices_actual = open_df_actual.loc[search_date]
+            except Exception:
+                pass
+        
+        for ticker in weights[weights != 0].index:
+            w = nw_actual[ticker]
+            position_jpy = abs(w) * (initial_capital * 10000 * eff_leverage_actual)
             
-            if len(individual_pnl) > 0:
-                top4_cols = st.columns(min(4, len(individual_pnl)))
-                for i, (ticker, pnl) in enumerate(individual_pnl.head(4).items()):
-                    with top4_cols[i]:
-                        st.metric(
-                            f"{i+1}位: {JP_TICKER_NAMES.get(ticker, ticker)}",
-                            f"{pnl * 100:+.2f}%",
-                            f"¥ {int(pnl * (initial_capital * 10000)):+,}"
-                        )
+            # 始値が取得可能なら株数ベースの実額で計算
+            if open_prices_actual is not None and ticker in open_prices_actual.index:
+                o_price = pd.to_numeric(open_prices_actual[ticker], errors='coerce')
+                if pd.notna(o_price) and o_price > 0:
+                    shares = max(1, int(position_jpy / o_price))
+                    actual_position = shares * o_price
+                    oc_r = oc_ret[ticker] if ticker in oc_ret.index else 0.0
+                    
+                    if w > 0:  # LONG
+                        ticker_pnl = oc_r * actual_position
+                    else:  # SHORT
+                        ticker_pnl = -oc_r * actual_position
+                    
+                    total_pnl_actual += ticker_pnl
+                    total_invested_actual += actual_position
+                    individual_pnl_actual[ticker] = ticker_pnl
+                    continue
+            
+            # フォールバック: 始値が取得できない場合はリターン×ポジション金額で計算
+            oc_r = oc_ret[ticker] if ticker in oc_ret.index else 0.0
+            if w > 0:
+                ticker_pnl = oc_r * position_jpy
+            else:
+                ticker_pnl = -oc_r * position_jpy
+            total_pnl_actual += ticker_pnl
+            total_invested_actual += position_jpy
+            individual_pnl_actual[ticker] = ticker_pnl
+        
+        port_ret_pct = (total_pnl_actual / total_invested_actual * 100) if total_invested_actual > 0 else 0.0
+
+        st.markdown("---")
+        st.subheader(f"実績: {search_date.strftime('%Y-%m-%d')}（始値→終値）")
+
+        col_res1, col_res2 = st.columns(2)
+        with col_res1:
+            st.metric("ポートフォリオリターン", f"{port_ret_pct:+.4f}%")
+        with col_res2:
+            st.metric("損益（円）", f"{total_pnl_actual:+,.0f}")
+            
+        st.markdown("**セクター別 損益寄与 (Top 4)**")
+        # 寄与度の計算
+        pnl_series = pd.Series(individual_pnl_actual).sort_values(ascending=False)
+        
+        if len(pnl_series) > 0:
+            top4_cols = st.columns(min(4, len(pnl_series)))
+            for i, (ticker, pnl_jpy_val) in enumerate(pnl_series.head(4).items()):
+                with top4_cols[i]:
+                    pnl_pct = (pnl_jpy_val / total_invested_actual * 100) if total_invested_actual > 0 else 0.0
+                    st.metric(
+                        f"{i+1}位: {JP_TICKER_NAMES.get(ticker, ticker)}",
+                        f"{pnl_pct:+.2f}%",
+                        f"¥ {int(pnl_jpy_val):+,}"
+                    )
 
     # --- 📊 過去の実績履歴一覧 (削除済み) ---
     pass
